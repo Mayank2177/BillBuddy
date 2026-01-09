@@ -63,4 +63,3 @@ streamlit run app.py --server.headless true --server.port 8501
 
 ---
 
-(Updated README to include clear steps to run the Streamlit app `app.py`.)
