@@ -5,7 +5,7 @@
 
 - Python 3.8+ installed
 
-## Install (recommended)
+## Setup for App:
 
 1. Clone the repo (or download):
    ```bash
