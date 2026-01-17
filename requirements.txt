@@ -1,0 +1,11 @@
+streamlit
+opencv-python
+python-dotenv
+google-generativeai
+pytesseract
+Pillow
+numpy
+sqlite3
+os
+pdf2image
+poppler-utils
