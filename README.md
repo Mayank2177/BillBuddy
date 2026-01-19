@@ -12,7 +12,7 @@ The Receipt and Invoice Digitizer is an AI-driven system that automatically scan
 1. Clone the repo (or download):
    ```bash
    git clone https://github.com/Mayank2177/RID_mayank.git
-   cd RID_mayank
+   cd app
    ```
 2. Create and activate a virtual environment (recommended):
    - macOS / Linux:
