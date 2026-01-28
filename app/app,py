@@ -1,15 +1,13 @@
 import streamlit as st
 import pandas as pd
+import ollama
 import matplotlib.pyplot as plt
 from PIL import Image
 from datetime import datetime, timedelta
-import streamlit as st
-import google.generativeai as genai
-from dotenv import load_dotenv
 import os
 import io
 
-from ocr_pipeline import preprocess_image, extract_text,create_download_link, process_invoice_file
+from ocr_pipeline import preprocess_image, extract_text,create_download_link, process_invoice_file, compute_image_hash, compute_text_fingerprint
 from pdf2image import convert_from_bytes
 from database import (
     init_db,
@@ -17,7 +15,8 @@ from database import (
     get_or_create_user,      # ← needed to get user_id from username
     get_user_invoices,       # ← to load history
     get_invoice_by_id,
-    delete_invoices_by_ids   # ← for deletion
+    delete_invoices_by_ids,  # ← for deletion
+       find_duplicates
 )
 
 # Initialize database
@@ -91,19 +90,44 @@ elif selection == "🔍 Analyzer":
 
 
     if uploaded_files:
-        results= []
-
         for uploaded_file in uploaded_files:
             st.subheader(f"Processing: {uploaded_file.name}")
 
-            # 1. Read file bytes ONCE
+            # Read file bytes
             file_bytes = uploaded_file.read()
-            uploaded_file.seek(0)  # Reset pointer
+            uploaded_file.seek(0)
+
+            # ✅ Get note FIRST (with unique key)
+            note = st.text_input(
+                f"📝 Notes for {uploaded_file.name}",
+                key=f"note_{uploaded_file.name}"  # ← Unique key per file
+            )
 
             try:
                 result = process_invoice_file(file_bytes, uploaded_file.name)
 
-                # 3. Show preview (PDF or image)
+                # Compute hashes
+                img_hash = compute_image_hash(file_bytes, uploaded_file.name)
+                text_fp = compute_text_fingerprint(result.get("raw_text", ""))
+
+                # Check duplicates BEFORE saving
+                duplicates = find_duplicates(user_id, img_hash, text_fp, result["fields"])
+
+                if duplicates:
+                    st.warning("⚠️ Possible duplicate detected!")
+                    for dup in duplicates:
+                        st.info(f"ID {dup['id']}: {dup['filename']} | Uploaded: {dup['upload_time']}")
+
+                    # ✅ Use checkbox to allow override — NO st.stop()
+                    if not st.checkbox("Save anyway?", key=f"override_{uploaded_file.name}"):
+                        st.info("Skipped saving.")
+                        continue  # ← Skip saving, but keep processing other files
+
+                # ✅ Save ONLY if not skipped
+                save_invoice(user_id, uploaded_file.name, file_bytes, result, notes=note)
+                st.success("✅ Saved!")
+
+                # Show preview
                 if uploaded_file.name.lower().endswith('.pdf'):
                     from pdf2image import convert_from_bytes
                     pages = convert_from_bytes(file_bytes, dpi=200)
@@ -113,8 +137,6 @@ elif selection == "🔍 Analyzer":
                     with col2:
                         processed_img = preprocess_image(pages[0])
                         st.image(processed_img, caption="Preprocessed", use_column_width=True)
-                    full_text = result["raw_text"]
-
                 else:
                     image = Image.open(io.BytesIO(file_bytes))
                     col1, col2 = st.columns(2)
@@ -123,16 +145,9 @@ elif selection == "🔍 Analyzer":
                     with col2:
                         processed_img = preprocess_image(image)
                         st.image(processed_img, caption="Preprocessed", use_column_width=True)
-                    full_text = result["raw_text"]
 
-
-                # 4. Display extracted text
-                st.text_area("Extracted Text", full_text, height=400)
-
-                # 5. ✅ SAVE TO DATABASE
-                save_invoice(user_id, uploaded_file.name, file_bytes, result)
-
-                st.success("✅ Invoice saved to History Vault!")
+                # Show extracted text
+                st.text_area("Extracted Text", result["raw_text"], height=300)
 
             except Exception as e:
                 st.error(f"Error processing {uploaded_file.name}: {str(e)}")
@@ -279,7 +294,7 @@ elif selection == "📜 History":
             "View details",
             options=[None] + df_display["id"].tolist(),  # Add None as first option
             format_func=lambda x: "Select an invoice..." if x is None else f"ID {x}: {df_display[df_display['id']==x]['filename'].iloc[0]}",
-            index=0  # Default to first item (the "Select..." placeholder)
+            index=0  # Default to first item (the "Select..." response_container)
         )
 
         if selected_id:
@@ -287,30 +302,48 @@ elif selection == "📜 History":
             if full_invoice:
                 st.subheader(f"📄 {full_invoice['filename']}")
 
-                # Try to show preview
+                # --- Show FULL INVOICE RECORD as a table ---
+                fields = full_invoice.get("fields", {})
+
+                # Build a flat dict of key fields
+                invoice_row = {
+                    "ID": full_invoice["id"],
+                    "Filename": full_invoice["filename"],
+                    "Upload Time": full_invoice["upload_time"],
+                    "Vendor": fields.get("vendor", "—"),
+                    "Invoice ID": fields.get("invoice_id", "—"),
+                    "Date": fields.get("date", "—"),
+                    "Tax": fields.get("tax", "—"),
+                    "Total Amount": fields.get("total_amount", "—"),
+                    "Notes": full_invoice.get("notes", "—")
+                }
+
+                # Display as single-row table
+                st.subheader("📋 Invoice Details")
+                df_row = pd.DataFrame([invoice_row])  # Wrap in list for single row
+                st.dataframe(df_row, use_container_width=True, hide_index=True)
+
+
+
+                # Show Image/PDF Preview
                 file_bytes = full_invoice["file_data"]
                 filename = full_invoice["filename"]
 
                 if filename.lower().endswith('.pdf'):
-                    st.info("📄 This is a PDF document")
                     try:
-                        # Convert first page to image for preview
                         from pdf2image import convert_from_bytes
                         first_page = convert_from_bytes(file_bytes, dpi=100, first_page=1, last_page=1)[0]
                         st.image(first_page, caption="First Page Preview", use_column_width=True)
                     except Exception as e:
                         st.error(f"❌ Could not generate preview: {str(e)}")
                 else:
-                    # It's an image
                     try:
                         img = Image.open(io.BytesIO(file_bytes))
                         st.image(img, caption="Original Image", use_column_width=True)
                     except Exception as e:
                         st.error(f"❌ Invalid image: {str(e)}")
 
-                # Show fields and text
-                st.json(full_invoice["fields"])
-                st.text_area("Extracted Text", full_invoice["raw_text"], height=300)
+
 
         # Multi-select for deletion
         selected_ids = st.multiselect(
@@ -332,16 +365,7 @@ elif selection == "📜 History":
 elif selection == "💬 Support":
     st.subheader("Ask your Queries about bills")
 
-    # Load API key (do this once at top of app.py ideally, but okay here too)
-    load_dotenv()
-    API_KEY = os.getenv("GEMINI_API_KEY")
-    if not API_KEY:
-        st.error("❌ GEMINI_API_KEY not found in .env file!")
-        st.stop()
-    genai.configure(api_key=API_KEY)
-
-    # ✅ CORRECT: Create actual model object
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    MODEL = 'gemma3:4b'
 
     # Initialize session state
     if "messages" not in st.session_state:
@@ -359,39 +383,30 @@ elif selection == "💬 Support":
         with st.chat_message("user"):
             st.markdown(prompt)
 
-        # Prepare history for Gemini (exclude current user message)
-        history = []
-        for msg in st.session_state.messages[:-1]:  # ← exclude the one we just added
-            role = "user" if msg["role"] == "user" else "model"
-            history.append({"role": role, "parts": [msg["content"]]})
-
-        # Stream response
+        # Stream response from Ollama
         with st.chat_message("assistant"):
             try:
-                # ✅ Now use the REAL model object
-                chat = model.start_chat(history=history)
-                response = chat.send_message(
-                    prompt,
-                    stream=True,
-                    safety_settings={
-                        'HATE': 'BLOCK_NONE',
-                        'HARASSMENT': 'BLOCK_NONE',
-                    }
+                full_response = ""
+                message_placeholder = st.empty()
+
+                # ✅ Ollama expects list of {"role", "content"}
+                stream = ollama.chat(
+                    model=MODEL,
+                    messages=st.session_state.messages,  # ← already in correct format!
+                    stream=True
                 )
 
-                full_response = ""
-                placeholder = st.empty()
-                for chunk in response:
-                    if chunk.text:
-                        full_response += chunk.text
-                        placeholder.markdown(full_response + "▌")
-                placeholder.markdown(full_response)
+                for chunk in stream:
+                    if 'message' in chunk and 'content' in chunk['message']:
+                        full_response += chunk['message']['content']
+                        message_placeholder.markdown(full_response + "▌")
 
-                # ✅ Fix: append to "messages", not "support_chat_messages"
+                message_placeholder.markdown(full_response)
                 st.session_state.messages.append({"role": "assistant", "content": full_response})
 
             except Exception as e:
-                st.error(f"An error occurred: {e}")
+                st.error(f"Error: {str(e)}")
+                st.info("💡 Make sure Ollama is running and the model is installed.")
 
 
 # tab 6: Environment Settings

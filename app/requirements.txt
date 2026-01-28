@@ -9,3 +9,8 @@ sqlite3
 os
 pdf2image
 poppler-utils
+zstd
+ollama
+imagehash
+Pillow
+spacy

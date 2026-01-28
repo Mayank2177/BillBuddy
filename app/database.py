@@ -1,6 +1,7 @@
 # database.py
 import sqlite3
 import os
+import re
 import json
 from datetime import datetime
 from typing import List
@@ -13,15 +14,6 @@ def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
 
-    # Create users table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            username TEXT UNIQUE NOT NULL
-        )
-    ''')
-
-    # Create invoices table
     c.execute('''
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY,
@@ -31,16 +23,18 @@ def init_db():
             raw_text TEXT NOT NULL,
             fields TEXT NOT NULL,
             file_data BLOB,
-            FOREIGN KEY (user_id) REFERENCES users (id)
+            notes TEXT DEFAULT '',
+            image_hash TEXT DEFAULT '',      -- NEW
+            text_fingerprint TEXT DEFAULT ''  -- NEW
         )
     ''')
 
-    # Ensure file_data column exists if table already existed
-
-    try:
-        c.execute("ALTER TABLE invoices ADD COLUMN file_data BLOB")
-    except sqlite3.OperationalError:
-        pass # Column already exists
+    # Safely add columns if missing
+    for col in ['image_hash', 'text_fingerprint']:
+        try:
+            c.execute(f"ALTER TABLE invoices ADD COLUMN {col} TEXT DEFAULT ''")
+        except sqlite3.OperationalError:
+            pass  # Already exists
 
     conn.commit()
     conn.close()
@@ -64,61 +58,71 @@ def get_or_create_user(username: str) -> int:
     return user_id
 
 
-def save_invoice(user_id: int, filename: str, file_content: bytes, result: dict):
-    # Prepare fields to store (flatten validation into fields)
+def save_invoice(user_id: int, filename: str, file_content: bytes, result: dict, notes: str = ""):
+    from ocr_pipeline import compute_image_hash, compute_text_fingerprint
+
+    # Compute hashes
+    img_hash = compute_image_hash(file_content, filename)
+    text_fp = compute_text_fingerprint(result.get("raw_text", ""))
+
     stored_fields = result["fields"].copy()
     stored_fields.update({
         "page_count": result.get("page_count", 1),
-        "raw_text": result.get("raw_text", "")[:500],  # store snippet only
+        "raw_text_snippet": result.get("raw_text", "")[:500],
         "validation": result.get("validation", {}),
-        "duplicates": [dup["id"] for dup in result.get("duplicates", [])]
+        "duplicates": []
     })
 
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    raw_text_to_save = result.get("raw_text", "")[:1000]  # truncate if needed
+    raw_text_to_save = result.get("raw_text", "")[:1000]
     c.execute('''
-        INSERT INTO invoices (user_id, filename, upload_time, raw_text, fields, file_data)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO invoices (
+            user_id, filename, upload_time, raw_text, fields, file_data, notes,
+            image_hash, text_fingerprint
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         user_id,
         filename,
         datetime.now().isoformat(),
-        raw_text_to_save,  # ← must be string, not None
+        raw_text_to_save,
         json.dumps(stored_fields),
-        file_content
+        file_content,
+        notes,
+        img_hash,
+        text_fp
     ))
     conn.commit()
     conn.close()
 
 
 def get_user_invoices(user_id: int) -> list:
-    """Get list of invoices for user (for table)"""
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row  # Enable dict-like access
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
-
-    c.execute('''
-        SELECT id, filename, upload_time, fields
-        FROM invoices
-        WHERE user_id = ?
-        ORDER BY upload_time DESC
-    ''', (user_id,))
-
+    c.execute('SELECT * FROM invoices WHERE user_id = ?', (user_id,))
     rows = c.fetchall()
+    conn.close()
+
     invoices = []
     for row in rows:
-        fields = json.loads(row['fields'])
-        invoices.append({
-            'id': row['id'],
-            'filename': row['filename'],
-            'upload_time': row['upload_time'],
-            'vendor': fields.get('vendor', '—'),
-            'total_amount': fields.get('total_amount', '—'),
-            'date': fields.get('date', '—')
-        })
+        # ✅ Convert Row to dict to enable .get()
+        row_dict = dict(row)
+        fields = json.loads(row_dict['fields'])
 
-    conn.close()
+        invoice = {
+            "id": row_dict["id"],
+            "filename": row_dict["filename"],
+            "upload_time": row_dict["upload_time"],
+            "vendor": fields.get("vendor", ""),
+            "invoice_id": fields.get("invoice_id", ""),
+            "date": fields.get("date", ""),
+            "total_amount": fields.get("total_amount", ""),
+            "notes": row_dict.get("notes", ""),  # ✅ Now safe!
+            "fields": fields
+        }
+        invoices.append(invoice)
     return invoices
 
 
@@ -158,4 +162,68 @@ def delete_invoices_by_ids(user_id: int, invoice_ids: List[int]):
     conn.close()
 
 
+def parse_amount(s):
+    try:
+        return float(re.sub(r'[^\d.]', '', s)) if s else 0.0
+    except:
+        return 0.0
+
+def find_duplicates(
+    user_id: int,
+    new_img_hash: str,
+    new_text_fp: str,
+    new_fields: dict
+) -> list:
+    """
+    Find duplicates using 3-layer approach:
+    1. Exact image hash match
+    2. Text fingerprint match
+    3. Field-based match (vendor + invoice_id + total)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+
+    # Layer 1: Image hash
+    if new_img_hash:
+        c.execute('''
+            SELECT * FROM invoices
+            WHERE user_id = ? AND image_hash = ?
+        ''', (user_id, new_img_hash))
+        rows = c.fetchall()
+        if rows:
+            conn.close()
+            return [dict(row) for row in rows]
+
+    # Layer 2: Text fingerprint
+    if new_text_fp:
+        c.execute('''
+            SELECT * FROM invoices
+            WHERE user_id = ? AND text_fingerprint = ?
+        ''', (user_id, new_text_fp))
+        rows = c.fetchall()
+        if rows:
+            conn.close()
+            return [dict(row) for row in rows]
+
+    # Layer 3: Field-based (fallback)
+    vendor = new_fields.get("vendor", "").lower()
+    inv_id = new_fields.get("invoice_id", "")
+    total = parse_amount(new_fields.get("total_amount", ""))
+
+    if vendor and inv_id and total > 0:
+        c.execute('''
+            SELECT * FROM invoices
+            WHERE user_id = ? AND fields LIKE ?
+        ''', (user_id, f'%{inv_id}%'))
+        rows = c.fetchall()
+        for row in rows:
+            fields = json.loads(row['fields'])
+            if (fields.get("vendor", "").lower() == vendor and
+                abs(parse_amount(fields.get("total_amount", "")) - total) / total <= 0.02):
+                conn.close()
+                return [dict(row)]
+
+    conn.close()
+    return []
 
